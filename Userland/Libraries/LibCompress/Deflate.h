@@ -13,6 +13,7 @@
 #include <AK/Forward.h>
 #include <AK/MaybeOwned.h>
 #include <AK/Stream.h>
+#include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibCompress/DeflateTables.h>
 
@@ -53,6 +54,55 @@ private:
 
 class DeflateDecompressor final : public Stream {
 private:
+    enum class BlockType {
+        Uncompressed = 0b00,
+        FixedCompressed = 0b01,
+        DynamicCompressed = 0b10,
+        // Anything else is invalid
+    };
+
+    class Header {
+    public:
+        Header(DeflateDecompressor& decompressor);
+
+        ErrorOr<BlockType> read_type_and_set_final_block();
+
+    private:
+        DeflateDecompressor& m_decompressor;
+    };
+
+    class UncompressedLength {
+    public:
+        UncompressedLength(DeflateDecompressor& decompressor);
+
+        ErrorOr<u16> read_length();
+
+    private:
+        DeflateDecompressor& m_decompressor;
+
+        u8 m_length_buf[sizeof(u16)];
+        u8 m_negated_length_buf[sizeof(u16)];
+        // Use counts instead of inline bytes because 'this' moves around as part of assigning the current state
+        size_t m_length_read;
+        size_t m_negated_length_read;
+    };
+
+    class DynamicCodes {
+    public:
+        DynamicCodes(DeflateDecompressor&);
+
+        ErrorOr<void> read_and_decode_codes();
+
+        CanonicalCode const& literal_code() const;
+
+        Optional<CanonicalCode> const& distance_code() const;
+
+    private:
+        DeflateDecompressor& m_decompressor;
+        CanonicalCode m_literal_code;
+        Optional<CanonicalCode> m_distance_code;
+    };
+
     class CompressedBlock {
     public:
         CompressedBlock(DeflateDecompressor&, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes);
@@ -78,13 +128,9 @@ private:
         size_t m_bytes_remaining;
     };
 
-    enum class State {
-        Idle,
-        ReadingCompressedBlock,
-        ReadingUncompressedBlock
-    };
-
 public:
+    friend Header;
+    friend UncompressedLength;
     friend CompressedBlock;
     friend UncompressedBlock;
 
@@ -104,17 +150,12 @@ private:
 
     ErrorOr<u32> decode_length(u32);
     ErrorOr<u32> decode_distance(u32);
-    ErrorOr<void> decode_codes(CanonicalCode& literal_code, Optional<CanonicalCode>& distance_code);
 
     static constexpr u16 max_back_reference_length = 258;
 
     bool m_read_final_block { false };
 
-    State m_state { State::Idle };
-    union {
-        CompressedBlock m_compressed_block;
-        UncompressedBlock m_uncompressed_block;
-    };
+    Variant<Header, UncompressedLength, UncompressedBlock, DynamicCodes, CompressedBlock> m_state;
 
     MaybeOwned<LittleEndianInputBitStream> m_input_stream;
     CircularBuffer m_output_buffer;

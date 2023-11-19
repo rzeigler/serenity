@@ -209,7 +209,8 @@ public:
     template<Unsigned T = u64>
     ErrorOr<T> peek_bits(size_t count)
     {
-        if (count > m_bit_count)
+        // We must continually try and fill the buffer in the case of partial reads
+        while (count > m_bit_count && !m_stream->is_eof())
             TRY(refill_buffer_from_stream());
 
         return m_bit_buffer & lsb_mask<T>(min(count, m_bit_count));

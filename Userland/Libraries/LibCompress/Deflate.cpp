@@ -6,12 +6,10 @@
  */
 
 #include <AK/Array.h>
-#include <AK/Assertions.h>
 #include <AK/BinaryHeap.h>
 #include <AK/BinarySearch.h>
 #include <AK/BitStream.h>
 #include <AK/MemoryStream.h>
-#include <string.h>
 
 #include <LibCompress/Deflate.h>
 
@@ -176,6 +174,136 @@ ErrorOr<void> CanonicalCode::write_symbol(LittleEndianOutputBitStream& stream, u
     return {};
 }
 
+DeflateDecompressor::Header::Header(DeflateDecompressor& decompressor)
+    : m_decompressor(decompressor)
+{
+}
+
+ErrorOr<DeflateDecompressor::BlockType> DeflateDecompressor::Header::read_type_and_set_final_block()
+{
+    long long unsigned result = TRY(m_decompressor.m_input_stream->read_bits(3));
+    // Its a little-endian bit stream so, the lowest bit is the first
+    m_decompressor.m_read_final_block = (result & 0b1) > 0;
+    long long unsigned block_type = result >> 1;
+    switch (block_type) {
+    case 0b00:
+        return BlockType::Uncompressed;
+    case 0b01:
+        return BlockType::FixedCompressed;
+    case 0b10:
+        return BlockType::DynamicCompressed;
+    default:
+        return Error::from_string_literal("Unhandled block type");
+    }
+}
+
+DeflateDecompressor::UncompressedLength::UncompressedLength(DeflateDecompressor& decompressor)
+    : m_decompressor(decompressor)
+    , m_length_read(0)
+    , m_negated_length_read(0)
+{
+}
+
+ErrorOr<u16> DeflateDecompressor::UncompressedLength::read_length()
+{
+    // Assumes that underlying bit stream is already aligned to byte boundary before first call
+    while (m_length_read < sizeof(m_length_buf)) {
+        Bytes const bytes { &m_length_buf, sizeof(m_length_buf) };
+        size_t const nread = TRY(m_decompressor.m_input_stream->read_some(bytes.slice(m_length_read))).size();
+        m_length_read += nread;
+    }
+    while (m_negated_length_read < sizeof(m_negated_length_buf)) {
+        Bytes const bytes { &m_negated_length_buf, sizeof(m_negated_length_buf) };
+        size_t const nread = TRY(m_decompressor.m_input_stream->read_some(bytes.slice(m_negated_length_read))).size();
+        m_negated_length_read += nread;
+    }
+    u16 const length = bit_cast<LittleEndian<u16>>(m_length_buf);
+    u16 const negated_length = bit_cast<LittleEndian<u16>>(m_negated_length_buf);
+    if ((length ^ 0xffff) != negated_length)
+        return Error::from_string_literal("Calculated negated length does not equal stored negated length");
+    return length;
+}
+
+DeflateDecompressor::DynamicCodes::DynamicCodes(DeflateDecompressor& decompressor)
+    : m_decompressor(decompressor)
+{
+}
+
+ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
+{
+    auto literal_code_count = TRY(m_decompressor.m_input_stream->read_bits(5)) + 257;
+    auto distance_code_count = TRY(m_decompressor.m_input_stream->read_bits(5)) + 1;
+    auto code_length_count = TRY(m_decompressor.m_input_stream->read_bits(4)) + 4;
+
+    // First we have to extract the code lengths of the code that was used to encode the code lengths of
+    // the code that was used to encode the block.
+
+    u8 code_lengths_code_lengths[19] = { 0 };
+    for (size_t i = 0; i < code_length_count; ++i) {
+        code_lengths_code_lengths[code_lengths_code_lengths_order[i]] = TRY(m_decompressor.m_input_stream->read_bits(3));
+    }
+
+    // Now we can extract the code that was used to encode the code lengths of the code that was used to
+    // encode the block.
+    auto const code_length_code = TRY(CanonicalCode::from_bytes({ code_lengths_code_lengths, sizeof(code_lengths_code_lengths) }));
+
+    // Next we extract the code lengths of the code that was used to encode the block.
+    Vector<u8, 286> code_lengths;
+    while (code_lengths.size() < literal_code_count + distance_code_count) {
+        auto symbol = TRY(code_length_code.read_symbol(*m_decompressor.m_input_stream));
+
+        if (symbol < deflate_special_code_length_copy) {
+            code_lengths.append(static_cast<u8>(symbol));
+        } else if (symbol == deflate_special_code_length_copy) {
+            if (code_lengths.is_empty())
+                return Error::from_string_literal("Found no codes to copy before a copy block");
+            auto nrepeat = 3 + TRY(m_decompressor.m_input_stream->read_bits(2));
+            for (size_t j = 0; j < nrepeat; ++j)
+                code_lengths.append(code_lengths.last());
+        } else if (symbol == deflate_special_code_length_zeros) {
+            auto nrepeat = 3 + TRY(m_decompressor.m_input_stream->read_bits(3));
+            for (size_t j = 0; j < nrepeat; ++j)
+                code_lengths.append(0);
+        } else {
+            VERIFY(symbol == deflate_special_code_length_long_zeros);
+            auto nrepeat = 11 + TRY(m_decompressor.m_input_stream->read_bits(7));
+            for (size_t j = 0; j < nrepeat; ++j)
+                code_lengths.append(0);
+        }
+    }
+
+    if (code_lengths.size() != literal_code_count + distance_code_count)
+        return Error::from_string_literal("Number of code lengths does not match the sum of codes");
+
+    // Now we extract the code that was used to encode literals and lengths in the block.
+    m_literal_code = TRY(CanonicalCode::from_bytes(code_lengths.span().trim(literal_code_count)));
+
+    // Now we extract the code that was used to encode distances in the block.
+
+    if (distance_code_count == 1) {
+        auto length = code_lengths[literal_code_count];
+
+        if (length == 0)
+            return {};
+        else if (length != 1)
+            return Error::from_string_literal("Length for a single distance code is longer than 1");
+    }
+
+    m_distance_code = TRY(CanonicalCode::from_bytes(code_lengths.span().slice(literal_code_count)));
+
+    return {};
+}
+
+CanonicalCode const& DeflateDecompressor::DynamicCodes::literal_code() const
+{
+    return m_literal_code;
+}
+
+Optional<CanonicalCode> const& DeflateDecompressor::DynamicCodes::distance_code() const
+{
+    return m_distance_code;
+}
+
 DeflateDecompressor::CompressedBlock::CompressedBlock(DeflateDecompressor& decompressor, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes)
     : m_decompressor(decompressor)
     , m_literal_codes(literal_codes)
@@ -253,109 +381,89 @@ ErrorOr<NonnullOwnPtr<DeflateDecompressor>> DeflateDecompressor::construct(Maybe
 }
 
 DeflateDecompressor::DeflateDecompressor(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer output_buffer)
-    : m_input_stream(move(stream))
+    : m_state(Header(*this))
+    , m_input_stream(move(stream))
     , m_output_buffer(move(output_buffer))
 {
 }
 
 DeflateDecompressor::~DeflateDecompressor()
 {
-    if (m_state == State::ReadingCompressedBlock)
-        m_compressed_block.~CompressedBlock();
-    if (m_state == State::ReadingUncompressedBlock)
-        m_uncompressed_block.~UncompressedBlock();
 }
 
 ErrorOr<Bytes> DeflateDecompressor::read_some(Bytes bytes)
 {
     size_t total_read = 0;
     while (total_read < bytes.size()) {
+        if (m_read_final_block && m_state.has<Header>()) {
+            break;
+        }
         auto slice = bytes.slice(total_read);
+        TRY(m_state.visit(
+            [this](Header& header) -> ErrorOr<void> {
+                auto const block_type = TRY(header.read_type_and_set_final_block());
+                switch (block_type) {
+                case BlockType::Uncompressed: {
+                    m_input_stream->align_to_byte_boundary();
+                    m_state.set(UncompressedLength(*this));
+                    break;
+                }
+                case BlockType::FixedCompressed:
+                    m_state.set(CompressedBlock(*this, CanonicalCode::fixed_literal_codes(), CanonicalCode::fixed_distance_codes()));
+                    break;
+                case BlockType::DynamicCompressed:
+                    // CanonicalCode literal_codes;
+                    // Optional<CanonicalCode> distance_codes;
+                    // TRY(decode_codes(literal_codes, distance_codes));
+                    // m_state.set(CompressedBlock(*this, literal_codes, distance_codes));
+                    m_state.set(DynamicCodes(*this));
+                    break;
+                }
+                return {};
+            },
+            [this](UncompressedLength& uncompressed_length) -> ErrorOr<void> {
+                u16 const length = TRY(uncompressed_length.read_length());
+                m_state.set(UncompressedBlock(*this, length));
+                return {};
+            },
+            [this, &slice, &total_read](UncompressedBlock& uncompressed_block) -> ErrorOr<void> {
+                auto nread = m_output_buffer.read(slice).size();
 
-        if (m_state == State::Idle) {
-            if (m_read_final_block)
-                break;
+                while (nread < slice.size() && TRY(uncompressed_block.try_read_more())) {
+                    nread += m_output_buffer.read(slice.slice(nread)).size();
+                }
 
-            m_read_final_block = TRY(m_input_stream->read_bit());
-            auto const block_type = TRY(m_input_stream->read_bits(2));
+                total_read += nread;
+                if (nread == slice.size())
+                    return {};
+                m_state.set(Header(*this));
+                return {};
+            },
+            [this](DynamicCodes& dynamic_codes) -> ErrorOr<void> {
+                TRY(dynamic_codes.read_and_decode_codes());
+                m_state.set(CompressedBlock(*this, dynamic_codes.literal_code(),
+                    dynamic_codes.distance_code()));
+                return {};
+            },
+            [this, &slice, &total_read](CompressedBlock& compressed_block) -> ErrorOr<void> {
+                auto nread = m_output_buffer.read(slice).size();
 
-            if (block_type == 0b00) {
-                m_input_stream->align_to_byte_boundary();
+                while (nread < slice.size() && TRY(compressed_block.try_read_more())) {
+                    nread += m_output_buffer.read(slice.slice(nread)).size();
+                }
 
-                u16 length = TRY(m_input_stream->read_value<LittleEndian<u16>>());
-                u16 negated_length = TRY(m_input_stream->read_value<LittleEndian<u16>>());
-
-                if ((length ^ 0xffff) != negated_length)
-                    return Error::from_string_literal("Calculated negated length does not equal stored negated length");
-
-                m_state = State::ReadingUncompressedBlock;
-                new (&m_uncompressed_block) UncompressedBlock(*this, length);
-
-                continue;
-            }
-
-            if (block_type == 0b01) {
-                m_state = State::ReadingCompressedBlock;
-                new (&m_compressed_block) CompressedBlock(*this, CanonicalCode::fixed_literal_codes(), CanonicalCode::fixed_distance_codes());
-
-                continue;
-            }
-
-            if (block_type == 0b10) {
-                CanonicalCode literal_codes;
-                Optional<CanonicalCode> distance_codes;
-                TRY(decode_codes(literal_codes, distance_codes));
-
-                m_state = State::ReadingCompressedBlock;
-                new (&m_compressed_block) CompressedBlock(*this, literal_codes, distance_codes);
-
-                continue;
-            }
-
-            return Error::from_string_literal("Unhandled block type for Idle state");
-        }
-
-        if (m_state == State::ReadingCompressedBlock) {
-            auto nread = m_output_buffer.read(slice).size();
-
-            while (nread < slice.size() && TRY(m_compressed_block.try_read_more())) {
-                nread += m_output_buffer.read(slice.slice(nread)).size();
-            }
-
-            total_read += nread;
-            if (nread == slice.size())
-                break;
-
-            m_compressed_block.~CompressedBlock();
-            m_state = State::Idle;
-
-            continue;
-        }
-
-        if (m_state == State::ReadingUncompressedBlock) {
-            auto nread = m_output_buffer.read(slice).size();
-
-            while (nread < slice.size() && TRY(m_uncompressed_block.try_read_more())) {
-                nread += m_output_buffer.read(slice.slice(nread)).size();
-            }
-
-            total_read += nread;
-            if (nread == slice.size())
-                break;
-
-            m_uncompressed_block.~UncompressedBlock();
-            m_state = State::Idle;
-
-            continue;
-        }
-
-        VERIFY_NOT_REACHED();
+                total_read += nread;
+                if (nread == slice.size())
+                    return {};
+                m_state.set(Header(*this));
+                return {};
+            }));
     }
 
-    return bytes.slice(0, total_read);
+    return bytes.trim(total_read);
 }
 
-bool DeflateDecompressor::is_eof() const { return m_state == State::Idle && m_read_final_block; }
+bool DeflateDecompressor::is_eof() const { return m_state.has<Header>() && m_read_final_block; }
 
 ErrorOr<size_t> DeflateDecompressor::write_some(ReadonlyBytes)
 {
@@ -422,71 +530,6 @@ ErrorOr<u32> DeflateDecompressor::decode_distance(u32 symbol)
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<void> DeflateDecompressor::decode_codes(CanonicalCode& literal_code, Optional<CanonicalCode>& distance_code)
-{
-    auto literal_code_count = TRY(m_input_stream->read_bits(5)) + 257;
-    auto distance_code_count = TRY(m_input_stream->read_bits(5)) + 1;
-    auto code_length_count = TRY(m_input_stream->read_bits(4)) + 4;
-
-    // First we have to extract the code lengths of the code that was used to encode the code lengths of
-    // the code that was used to encode the block.
-
-    u8 code_lengths_code_lengths[19] = { 0 };
-    for (size_t i = 0; i < code_length_count; ++i) {
-        code_lengths_code_lengths[code_lengths_code_lengths_order[i]] = TRY(m_input_stream->read_bits(3));
-    }
-
-    // Now we can extract the code that was used to encode the code lengths of the code that was used to
-    // encode the block.
-    auto const code_length_code = TRY(CanonicalCode::from_bytes({ code_lengths_code_lengths, sizeof(code_lengths_code_lengths) }));
-
-    // Next we extract the code lengths of the code that was used to encode the block.
-    Vector<u8, 286> code_lengths;
-    while (code_lengths.size() < literal_code_count + distance_code_count) {
-        auto symbol = TRY(code_length_code.read_symbol(*m_input_stream));
-
-        if (symbol < deflate_special_code_length_copy) {
-            code_lengths.append(static_cast<u8>(symbol));
-        } else if (symbol == deflate_special_code_length_copy) {
-            if (code_lengths.is_empty())
-                return Error::from_string_literal("Found no codes to copy before a copy block");
-            auto nrepeat = 3 + TRY(m_input_stream->read_bits(2));
-            for (size_t j = 0; j < nrepeat; ++j)
-                code_lengths.append(code_lengths.last());
-        } else if (symbol == deflate_special_code_length_zeros) {
-            auto nrepeat = 3 + TRY(m_input_stream->read_bits(3));
-            for (size_t j = 0; j < nrepeat; ++j)
-                code_lengths.append(0);
-        } else {
-            VERIFY(symbol == deflate_special_code_length_long_zeros);
-            auto nrepeat = 11 + TRY(m_input_stream->read_bits(7));
-            for (size_t j = 0; j < nrepeat; ++j)
-                code_lengths.append(0);
-        }
-    }
-
-    if (code_lengths.size() != literal_code_count + distance_code_count)
-        return Error::from_string_literal("Number of code lengths does not match the sum of codes");
-
-    // Now we extract the code that was used to encode literals and lengths in the block.
-    literal_code = TRY(CanonicalCode::from_bytes(code_lengths.span().trim(literal_code_count)));
-
-    // Now we extract the code that was used to encode distances in the block.
-
-    if (distance_code_count == 1) {
-        auto length = code_lengths[literal_code_count];
-
-        if (length == 0)
-            return {};
-        else if (length != 1)
-            return Error::from_string_literal("Length for a single distance code is longer than 1");
-    }
-
-    distance_code = TRY(CanonicalCode::from_bytes(code_lengths.span().slice(literal_code_count)));
-
-    return {};
-}
-
 ErrorOr<NonnullOwnPtr<DeflateCompressor>> DeflateCompressor::construct(MaybeOwned<Stream> stream, CompressionLevel compression_level)
 {
     auto bit_stream = TRY(try_make<LittleEndianOutputBitStream>(move(stream)));
@@ -548,7 +591,7 @@ void DeflateCompressor::close()
 // Knuth's multiplicative hash on 4 bytes
 u16 DeflateCompressor::hash_sequence(u8 const* bytes)
 {
-    constexpr const u32 knuth_constant = 2654435761; // shares no common factors with 2^32
+    constexpr u32 const knuth_constant = 2654435761; // shares no common factors with 2^32
     return ((bytes[0] | bytes[1] << 8 | bytes[2] << 16 | bytes[3] << 24) * knuth_constant) >> (32 - hash_bits);
 }
 
@@ -1070,5 +1113,4 @@ ErrorOr<ByteBuffer> DeflateCompressor::compress_all(ReadonlyBytes bytes, Compres
 
     return buffer;
 }
-
 }
