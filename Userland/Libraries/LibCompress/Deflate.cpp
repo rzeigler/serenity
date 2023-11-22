@@ -9,6 +9,7 @@
 #include <AK/BinaryHeap.h>
 #include <AK/BinarySearch.h>
 #include <AK/BitStream.h>
+#include <AK/MaybeOwned.h>
 #include <AK/MemoryStream.h>
 
 #include <LibCompress/Deflate.h>
@@ -174,31 +175,31 @@ ErrorOr<void> CanonicalCode::write_symbol(LittleEndianOutputBitStream& stream, u
     return {};
 }
 
-DeflateDecompressor::Header::Header(DeflateDecompressor& decompressor)
-    : m_decompressor(decompressor)
+DeflateDecompressor::Header::Header(AK::MaybeOwned<LittleEndianInputBitStream> stream)
+    : m_input_stream(move(stream))
 {
 }
 
-ErrorOr<DeflateDecompressor::BlockType> DeflateDecompressor::Header::read_type_and_set_final_block()
+ErrorOr<DeflateDecompressor::Header::Result> DeflateDecompressor::Header::read_type_and_final_block()
 {
-    long long unsigned result = TRY(m_decompressor.m_input_stream->read_bits(3));
+    long long unsigned result = TRY(m_input_stream->read_bits(3));
     // Its a little-endian bit stream so, the lowest bit is the first
-    m_decompressor.m_read_final_block = (result & 0b1) > 0;
+    bool const read_final_block = (result & 0b1) > 0;
     long long unsigned block_type = result >> 1;
     switch (block_type) {
     case 0b00:
-        return BlockType::Uncompressed;
+        return Result { read_final_block, BlockType::Uncompressed };
     case 0b01:
-        return BlockType::FixedCompressed;
+        return Result { read_final_block, BlockType::FixedCompressed };
     case 0b10:
-        return BlockType::DynamicCompressed;
+        return Result { read_final_block, BlockType::DynamicCompressed };
     default:
         return Error::from_string_literal("Unhandled block type");
     }
 }
 
-DeflateDecompressor::UncompressedLength::UncompressedLength(DeflateDecompressor& decompressor)
-    : m_decompressor(decompressor)
+DeflateDecompressor::UncompressedLength::UncompressedLength(MaybeOwned<LittleEndianInputBitStream> stream)
+    : m_input_stream(std::move(stream))
     , m_length_read(0)
     , m_negated_length_read(0)
 {
@@ -209,12 +210,12 @@ ErrorOr<u16> DeflateDecompressor::UncompressedLength::read_length()
     // Assumes that underlying bit stream is already aligned to byte boundary before first call
     while (m_length_read < sizeof(m_length_buf)) {
         Bytes const bytes { &m_length_buf, sizeof(m_length_buf) };
-        size_t const nread = TRY(m_decompressor.m_input_stream->read_some(bytes.slice(m_length_read))).size();
+        size_t const nread = TRY(m_input_stream->read_some(bytes.slice(m_length_read))).size();
         m_length_read += nread;
     }
     while (m_negated_length_read < sizeof(m_negated_length_buf)) {
         Bytes const bytes { &m_negated_length_buf, sizeof(m_negated_length_buf) };
-        size_t const nread = TRY(m_decompressor.m_input_stream->read_some(bytes.slice(m_negated_length_read))).size();
+        size_t const nread = TRY(m_input_stream->read_some(bytes.slice(m_negated_length_read))).size();
         m_negated_length_read += nread;
     }
     u16 const length = bit_cast<LittleEndian<u16>>(m_length_buf);
@@ -224,23 +225,23 @@ ErrorOr<u16> DeflateDecompressor::UncompressedLength::read_length()
     return length;
 }
 
-DeflateDecompressor::DynamicCodes::DynamicCodes(DeflateDecompressor& decompressor)
-    : m_decompressor(decompressor)
+DeflateDecompressor::DynamicCodes::DynamicCodes(MaybeOwned<LittleEndianInputBitStream> stream)
+    : m_input_stream(move(stream))
 {
 }
 
 ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
 {
-    auto literal_code_count = TRY(m_decompressor.m_input_stream->read_bits(5)) + 257;
-    auto distance_code_count = TRY(m_decompressor.m_input_stream->read_bits(5)) + 1;
-    auto code_length_count = TRY(m_decompressor.m_input_stream->read_bits(4)) + 4;
+    auto literal_code_count = TRY(m_input_stream->read_bits(5)) + 257;
+    auto distance_code_count = TRY(m_input_stream->read_bits(5)) + 1;
+    auto code_length_count = TRY(m_input_stream->read_bits(4)) + 4;
 
     // First we have to extract the code lengths of the code that was used to encode the code lengths of
     // the code that was used to encode the block.
 
     u8 code_lengths_code_lengths[19] = { 0 };
     for (size_t i = 0; i < code_length_count; ++i) {
-        code_lengths_code_lengths[code_lengths_code_lengths_order[i]] = TRY(m_decompressor.m_input_stream->read_bits(3));
+        code_lengths_code_lengths[code_lengths_code_lengths_order[i]] = TRY(m_input_stream->read_bits(3));
     }
 
     // Now we can extract the code that was used to encode the code lengths of the code that was used to
@@ -250,23 +251,23 @@ ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
     // Next we extract the code lengths of the code that was used to encode the block.
     Vector<u8, 286> code_lengths;
     while (code_lengths.size() < literal_code_count + distance_code_count) {
-        auto symbol = TRY(code_length_code.read_symbol(*m_decompressor.m_input_stream));
+        auto symbol = TRY(code_length_code.read_symbol(*m_input_stream));
 
         if (symbol < deflate_special_code_length_copy) {
             code_lengths.append(static_cast<u8>(symbol));
         } else if (symbol == deflate_special_code_length_copy) {
             if (code_lengths.is_empty())
                 return Error::from_string_literal("Found no codes to copy before a copy block");
-            auto nrepeat = 3 + TRY(m_decompressor.m_input_stream->read_bits(2));
+            auto nrepeat = 3 + TRY(m_input_stream->read_bits(2));
             for (size_t j = 0; j < nrepeat; ++j)
                 code_lengths.append(code_lengths.last());
         } else if (symbol == deflate_special_code_length_zeros) {
-            auto nrepeat = 3 + TRY(m_decompressor.m_input_stream->read_bits(3));
+            auto nrepeat = 3 + TRY(m_input_stream->read_bits(3));
             for (size_t j = 0; j < nrepeat; ++j)
                 code_lengths.append(0);
         } else {
             VERIFY(symbol == deflate_special_code_length_long_zeros);
-            auto nrepeat = 11 + TRY(m_decompressor.m_input_stream->read_bits(7));
+            auto nrepeat = 11 + TRY(m_input_stream->read_bits(7));
             for (size_t j = 0; j < nrepeat; ++j)
                 code_lengths.append(0);
         }
@@ -304,8 +305,9 @@ Optional<CanonicalCode> const& DeflateDecompressor::DynamicCodes::distance_code(
     return m_distance_code;
 }
 
-DeflateDecompressor::CompressedBlock::CompressedBlock(DeflateDecompressor& decompressor, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes)
-    : m_decompressor(decompressor)
+DeflateDecompressor::CompressedBlock::CompressedBlock(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer& output_buffer, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes)
+    : m_input_stream(std::move(stream))
+    , m_output_buffer(output_buffer)
     , m_literal_codes(literal_codes)
     , m_distance_codes(distance_codes)
 {
@@ -316,14 +318,14 @@ ErrorOr<bool> DeflateDecompressor::CompressedBlock::try_read_more()
     if (m_eof == true)
         return false;
 
-    auto const symbol = TRY(m_literal_codes.read_symbol(*m_decompressor.m_input_stream));
+    auto const symbol = TRY(m_literal_codes.read_symbol(*m_input_stream));
 
     if (symbol >= 286)
         return Error::from_string_literal("Invalid deflate literal/length symbol");
 
     if (symbol < 256) {
         u8 byte_symbol = symbol;
-        m_decompressor.m_output_buffer.write({ &byte_symbol, sizeof(byte_symbol) });
+        m_output_buffer.write({ &byte_symbol, sizeof(byte_symbol) });
         return true;
     }
 
@@ -335,14 +337,14 @@ ErrorOr<bool> DeflateDecompressor::CompressedBlock::try_read_more()
     if (!m_distance_codes.has_value())
         return Error::from_string_literal("Distance codes have not been initialized");
 
-    auto const length = TRY(m_decompressor.decode_length(symbol));
-    auto const distance_symbol = TRY(m_distance_codes.value().read_symbol(*m_decompressor.m_input_stream));
+    auto const length = TRY(decode_length(symbol));
+    auto const distance_symbol = TRY(m_distance_codes.value().read_symbol(*m_input_stream));
     if (distance_symbol >= 30)
         return Error::from_string_literal("Invalid deflate distance symbol");
 
-    auto const distance = TRY(m_decompressor.decode_distance(distance_symbol));
+    auto const distance = TRY(decode_distance(distance_symbol));
 
-    auto copied_length = TRY(m_decompressor.m_output_buffer.copy_from_seekback(distance, length));
+    auto copied_length = TRY(m_output_buffer.copy_from_seekback(distance, length));
 
     // TODO: What should we do if the output buffer is full?
     VERIFY(copied_length == length);
@@ -350,8 +352,42 @@ ErrorOr<bool> DeflateDecompressor::CompressedBlock::try_read_more()
     return true;
 }
 
-DeflateDecompressor::UncompressedBlock::UncompressedBlock(DeflateDecompressor& decompressor, size_t length)
-    : m_decompressor(decompressor)
+ErrorOr<u32> DeflateDecompressor::CompressedBlock::decode_length(u32 symbol)
+{
+    // FIXME: I can't quite follow the algorithm here, but it seems to work.
+
+    if (symbol <= 264)
+        return symbol - 254;
+
+    if (symbol <= 284) {
+        auto extra_bits = (symbol - 261) / 4;
+        return (((symbol - 265) % 4 + 4) << extra_bits) + 3 + TRY(m_input_stream->read_bits(extra_bits));
+    }
+
+    if (symbol == 285)
+        return DeflateDecompressor::max_back_reference_length;
+
+    VERIFY_NOT_REACHED();
+}
+
+ErrorOr<u32> DeflateDecompressor::CompressedBlock::decode_distance(u32 symbol)
+{
+    // FIXME: I can't quite follow the algorithm here, but it seems to work.
+
+    if (symbol <= 3)
+        return symbol + 1;
+
+    if (symbol <= 29) {
+        auto extra_bits = (symbol / 2) - 1;
+        return ((symbol % 2 + 2) << extra_bits) + 1 + TRY(m_input_stream->read_bits(extra_bits));
+    }
+
+    VERIFY_NOT_REACHED();
+}
+
+DeflateDecompressor::UncompressedBlock::UncompressedBlock(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer& output_buffer, size_t length)
+    : m_input_stream(std::move(stream))
+    , m_output_buffer(output_buffer)
     , m_bytes_remaining(length)
 {
 }
@@ -361,13 +397,13 @@ ErrorOr<bool> DeflateDecompressor::UncompressedBlock::try_read_more()
     if (m_bytes_remaining == 0)
         return false;
 
-    if (m_decompressor.m_input_stream->is_eof())
+    if (m_input_stream->is_eof())
         return Error::from_string_literal("Input data ends in the middle of an uncompressed DEFLATE block");
 
     Array<u8, 4096> temporary_buffer;
-    auto readable_bytes = temporary_buffer.span().trim(min(m_bytes_remaining, m_decompressor.m_output_buffer.empty_space()));
-    auto read_bytes = TRY(m_decompressor.m_input_stream->read_some(readable_bytes));
-    auto written_bytes = m_decompressor.m_output_buffer.write(read_bytes);
+    auto readable_bytes = temporary_buffer.span().trim(min(m_bytes_remaining, m_output_buffer.empty_space()));
+    auto read_bytes = TRY(m_input_stream->read_some(readable_bytes));
+    auto written_bytes = m_output_buffer.write(read_bytes);
     VERIFY(read_bytes.size() == written_bytes);
 
     m_bytes_remaining -= written_bytes;
@@ -381,8 +417,8 @@ ErrorOr<NonnullOwnPtr<DeflateDecompressor>> DeflateDecompressor::construct(Maybe
 }
 
 DeflateDecompressor::DeflateDecompressor(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer output_buffer)
-    : m_state(Header(*this))
-    , m_input_stream(move(stream))
+    : m_input_stream(move(stream))
+    , m_state(Header(MaybeOwned(*m_input_stream)))
     , m_output_buffer(move(output_buffer))
 {
 }
@@ -401,29 +437,26 @@ ErrorOr<Bytes> DeflateDecompressor::read_some(Bytes bytes)
         auto slice = bytes.slice(total_read);
         TRY(m_state.visit(
             [this](Header& header) -> ErrorOr<void> {
-                auto const block_type = TRY(header.read_type_and_set_final_block());
+                auto const [final_block, block_type] = TRY(header.read_type_and_final_block());
                 switch (block_type) {
                 case BlockType::Uncompressed: {
                     m_input_stream->align_to_byte_boundary();
-                    m_state.set(UncompressedLength(*this));
+                    m_state.set(UncompressedLength(MaybeOwned(*m_input_stream)));
                     break;
                 }
                 case BlockType::FixedCompressed:
-                    m_state.set(CompressedBlock(*this, CanonicalCode::fixed_literal_codes(), CanonicalCode::fixed_distance_codes()));
+                    m_state.set(CompressedBlock(MaybeOwned(*m_input_stream), m_output_buffer, CanonicalCode::fixed_literal_codes(), CanonicalCode::fixed_distance_codes()));
                     break;
                 case BlockType::DynamicCompressed:
-                    // CanonicalCode literal_codes;
-                    // Optional<CanonicalCode> distance_codes;
-                    // TRY(decode_codes(literal_codes, distance_codes));
-                    // m_state.set(CompressedBlock(*this, literal_codes, distance_codes));
-                    m_state.set(DynamicCodes(*this));
+                    m_state.set(DynamicCodes(MaybeOwned(*m_input_stream)));
                     break;
                 }
+                m_read_final_block = final_block;
                 return {};
             },
             [this](UncompressedLength& uncompressed_length) -> ErrorOr<void> {
                 u16 const length = TRY(uncompressed_length.read_length());
-                m_state.set(UncompressedBlock(*this, length));
+                m_state.set(UncompressedBlock(MaybeOwned(*m_input_stream), m_output_buffer, length));
                 return {};
             },
             [this, &slice, &total_read](UncompressedBlock& uncompressed_block) -> ErrorOr<void> {
@@ -436,12 +469,12 @@ ErrorOr<Bytes> DeflateDecompressor::read_some(Bytes bytes)
                 total_read += nread;
                 if (nread == slice.size())
                     return {};
-                m_state.set(Header(*this));
+                m_state.set(Header(MaybeOwned(*m_input_stream)));
                 return {};
             },
             [this](DynamicCodes& dynamic_codes) -> ErrorOr<void> {
                 TRY(dynamic_codes.read_and_decode_codes());
-                m_state.set(CompressedBlock(*this, dynamic_codes.literal_code(),
+                m_state.set(CompressedBlock(MaybeOwned(*m_input_stream), m_output_buffer, dynamic_codes.literal_code(),
                     dynamic_codes.distance_code()));
                 return {};
             },
@@ -455,7 +488,7 @@ ErrorOr<Bytes> DeflateDecompressor::read_some(Bytes bytes)
                 total_read += nread;
                 if (nread == slice.size())
                     return {};
-                m_state.set(Header(*this));
+                m_state.set(Header(MaybeOwned(*m_input_stream)));
                 return {};
             }));
     }
@@ -495,39 +528,6 @@ ErrorOr<ByteBuffer> DeflateDecompressor::decompress_all(ReadonlyBytes bytes)
     auto output_buffer = TRY(ByteBuffer::create_uninitialized(output_stream.used_buffer_size()));
     TRY(output_stream.read_until_filled(output_buffer));
     return output_buffer;
-}
-
-ErrorOr<u32> DeflateDecompressor::decode_length(u32 symbol)
-{
-    // FIXME: I can't quite follow the algorithm here, but it seems to work.
-
-    if (symbol <= 264)
-        return symbol - 254;
-
-    if (symbol <= 284) {
-        auto extra_bits = (symbol - 261) / 4;
-        return (((symbol - 265) % 4 + 4) << extra_bits) + 3 + TRY(m_input_stream->read_bits(extra_bits));
-    }
-
-    if (symbol == 285)
-        return DeflateDecompressor::max_back_reference_length;
-
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<u32> DeflateDecompressor::decode_distance(u32 symbol)
-{
-    // FIXME: I can't quite follow the algorithm here, but it seems to work.
-
-    if (symbol <= 3)
-        return symbol + 1;
-
-    if (symbol <= 29) {
-        auto extra_bits = (symbol / 2) - 1;
-        return ((symbol % 2 + 2) << extra_bits) + 1 + TRY(m_input_stream->read_bits(extra_bits));
-    }
-
-    VERIFY_NOT_REACHED();
 }
 
 ErrorOr<NonnullOwnPtr<DeflateCompressor>> DeflateCompressor::construct(MaybeOwned<Stream> stream, CompressionLevel compression_level)

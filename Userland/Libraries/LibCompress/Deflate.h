@@ -63,22 +63,27 @@ private:
 
     class Header {
     public:
-        Header(DeflateDecompressor& decompressor);
+        struct Result {
+            bool final_block;
+            BlockType block_type;
+        };
 
-        ErrorOr<BlockType> read_type_and_set_final_block();
+        Header(MaybeOwned<LittleEndianInputBitStream>);
+
+        ErrorOr<Result> read_type_and_final_block();
 
     private:
-        DeflateDecompressor& m_decompressor;
+        AK::MaybeOwned<LittleEndianInputBitStream> m_input_stream;
     };
 
     class UncompressedLength {
     public:
-        UncompressedLength(DeflateDecompressor& decompressor);
+        UncompressedLength(MaybeOwned<LittleEndianInputBitStream>);
 
         ErrorOr<u16> read_length();
 
     private:
-        DeflateDecompressor& m_decompressor;
+        MaybeOwned<LittleEndianInputBitStream> m_input_stream;
 
         u8 m_length_buf[sizeof(u16)];
         u8 m_negated_length_buf[sizeof(u16)];
@@ -89,51 +94,50 @@ private:
 
     class DynamicCodes {
     public:
-        DynamicCodes(DeflateDecompressor&);
+        DynamicCodes(MaybeOwned<LittleEndianInputBitStream>);
 
         ErrorOr<void> read_and_decode_codes();
 
         CanonicalCode const& literal_code() const;
-
         Optional<CanonicalCode> const& distance_code() const;
 
     private:
-        DeflateDecompressor& m_decompressor;
+        MaybeOwned<LittleEndianInputBitStream> m_input_stream;
         CanonicalCode m_literal_code;
         Optional<CanonicalCode> m_distance_code;
     };
 
     class CompressedBlock {
     public:
-        CompressedBlock(DeflateDecompressor&, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes);
+        CompressedBlock(MaybeOwned<LittleEndianInputBitStream>, CircularBuffer&, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes);
 
         ErrorOr<bool> try_read_more();
 
     private:
         bool m_eof { false };
 
-        DeflateDecompressor& m_decompressor;
+        ErrorOr<u32> decode_length(u32);
+        ErrorOr<u32> decode_distance(u32);
+
+        MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+        CircularBuffer& m_output_buffer;
         CanonicalCode m_literal_codes;
         Optional<CanonicalCode> m_distance_codes;
     };
 
     class UncompressedBlock {
     public:
-        UncompressedBlock(DeflateDecompressor&, size_t);
+        UncompressedBlock(MaybeOwned<LittleEndianInputBitStream>, CircularBuffer& output_buffer, size_t);
 
         ErrorOr<bool> try_read_more();
 
     private:
-        DeflateDecompressor& m_decompressor;
+        MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+        CircularBuffer& m_output_buffer;
         size_t m_bytes_remaining;
     };
 
 public:
-    friend Header;
-    friend UncompressedLength;
-    friend CompressedBlock;
-    friend UncompressedBlock;
-
     static ErrorOr<NonnullOwnPtr<DeflateDecompressor>> construct(MaybeOwned<LittleEndianInputBitStream> stream);
     ~DeflateDecompressor();
 
@@ -148,16 +152,14 @@ public:
 private:
     DeflateDecompressor(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer buffer);
 
-    ErrorOr<u32> decode_length(u32);
-    ErrorOr<u32> decode_distance(u32);
+    ErrorOr<void> decode_codes(CanonicalCode& literal_code, Optional<CanonicalCode>& distance_code);
 
     static constexpr u16 max_back_reference_length = 258;
 
     bool m_read_final_block { false };
 
-    Variant<Header, UncompressedLength, UncompressedBlock, DynamicCodes, CompressedBlock> m_state;
-
     MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+    Variant<Header, UncompressedLength, UncompressedBlock, DynamicCodes, CompressedBlock> m_state;
     CircularBuffer m_output_buffer;
 };
 
