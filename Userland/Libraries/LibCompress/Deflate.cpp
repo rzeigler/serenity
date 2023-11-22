@@ -227,20 +227,98 @@ ErrorOr<u16> DeflateDecompressor::UncompressedLength::read_length()
 
 DeflateDecompressor::DynamicCodes::DynamicCodes(MaybeOwned<LittleEndianInputBitStream> stream)
     : m_input_stream(move(stream))
+    , m_state(ReadLiteralCodeCount(MaybeOwned(*m_input_stream)))
 {
 }
 
 ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
 {
-    auto literal_code_count = TRY(m_input_stream->read_bits(5)) + 257;
-    auto distance_code_count = TRY(m_input_stream->read_bits(5)) + 1;
-    auto code_length_count = TRY(m_input_stream->read_bits(4)) + 4;
+    while (!m_state.has<Complete>()) {
+        TRY(m_state.visit(
+            [this](ReadLiteralCodeCount& literal_code_count) -> ErrorOr<void> {
+                m_literal_code_count = TRY(literal_code_count.read_literal_code_count());
+                m_state.set(ReadDistanceCodeCount(MaybeOwned(*m_input_stream)));
+                return {};
+            },
+            [this](ReadDistanceCodeCount& distance_code_count) -> ErrorOr<void> {
+                m_distance_code_count = TRY(distance_code_count.read_distance_code_count());
+                m_state.set(ReadCodeLength(MaybeOwned(*m_input_stream)));
+                return {};
+            },
+            [this](ReadCodeLength& code_length) -> ErrorOr<void> {
+                m_code_length_count = TRY(code_length.read_code_length_count());
+                m_state.set(Remainder(MaybeOwned(*m_input_stream), m_literal_code, m_distance_code, m_literal_code_count, m_distance_code_count, m_code_length_count));
+                return {};
+            },
+            [this](Remainder& remainder) -> ErrorOr<void> {
+                TRY(remainder.read_remainder());
+                m_state.set(Complete());
+                return {};
+            },
+            [](Complete&) -> ErrorOr<void> {
+                VERIFY_NOT_REACHED();
+            }));
+    }
+    return {};
+}
 
+CanonicalCode const& DeflateDecompressor::DynamicCodes::literal_code() const
+{
+    return m_literal_code;
+}
+
+Optional<CanonicalCode> const& DeflateDecompressor::DynamicCodes::distance_code() const
+{
+    return m_distance_code;
+}
+
+DeflateDecompressor::DynamicCodes::ReadLiteralCodeCount::ReadLiteralCodeCount(MaybeOwned<LittleEndianInputBitStream> stream)
+    : m_input_stream(std::move(stream))
+{
+}
+
+ErrorOr<u64> DeflateDecompressor::DynamicCodes::ReadLiteralCodeCount::read_literal_code_count()
+{
+    return TRY(m_input_stream->read_bits(5)) + 257;
+}
+
+DeflateDecompressor::DynamicCodes::ReadDistanceCodeCount::ReadDistanceCodeCount(MaybeOwned<AK::LittleEndianInputBitStream> stream)
+    : m_input_stream(std::move(stream))
+{
+}
+
+ErrorOr<u64> DeflateDecompressor::DynamicCodes::ReadDistanceCodeCount::read_distance_code_count()
+{
+    return TRY(m_input_stream->read_bits(5)) + 1;
+}
+
+DeflateDecompressor::DynamicCodes::ReadCodeLength::ReadCodeLength(MaybeOwned<AK::LittleEndianInputBitStream> stream)
+    : m_input_stream(std::move(stream))
+{
+}
+
+ErrorOr<u64> DeflateDecompressor::DynamicCodes::ReadCodeLength::read_code_length_count()
+{
+    return TRY(m_input_stream->read_bits(4)) + 4;
+}
+
+DeflateDecompressor::DynamicCodes::Remainder::Remainder(MaybeOwned<AK::LittleEndianInputBitStream> stream, Compress::CanonicalCode& literal_code, Optional<Compress::CanonicalCode>& distance_code, u64 literal_code_count, u64 distance_code_count, u64 code_length_count)
+    : m_input_stream(std::move(stream))
+    , m_literal_code(literal_code)
+    , m_distance_code(distance_code)
+    , m_literal_code_count(literal_code_count)
+    , m_distance_code_count(distance_code_count)
+    , m_code_length_count(code_length_count)
+{
+}
+
+ErrorOr<void> DeflateDecompressor::DynamicCodes::Remainder::read_remainder()
+{
     // First we have to extract the code lengths of the code that was used to encode the code lengths of
     // the code that was used to encode the block.
 
     u8 code_lengths_code_lengths[19] = { 0 };
-    for (size_t i = 0; i < code_length_count; ++i) {
+    for (size_t i = 0; i < m_code_length_count; ++i) {
         code_lengths_code_lengths[code_lengths_code_lengths_order[i]] = TRY(m_input_stream->read_bits(3));
     }
 
@@ -250,7 +328,7 @@ ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
 
     // Next we extract the code lengths of the code that was used to encode the block.
     Vector<u8, 286> code_lengths;
-    while (code_lengths.size() < literal_code_count + distance_code_count) {
+    while (code_lengths.size() < m_literal_code_count + m_distance_code_count) {
         auto symbol = TRY(code_length_code.read_symbol(*m_input_stream));
 
         if (symbol < deflate_special_code_length_copy) {
@@ -273,16 +351,16 @@ ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
         }
     }
 
-    if (code_lengths.size() != literal_code_count + distance_code_count)
+    if (code_lengths.size() != m_literal_code_count + m_distance_code_count)
         return Error::from_string_literal("Number of code lengths does not match the sum of codes");
 
     // Now we extract the code that was used to encode literals and lengths in the block.
-    m_literal_code = TRY(CanonicalCode::from_bytes(code_lengths.span().trim(literal_code_count)));
+    m_literal_code = TRY(CanonicalCode::from_bytes(code_lengths.span().trim(m_literal_code_count)));
 
     // Now we extract the code that was used to encode distances in the block.
 
-    if (distance_code_count == 1) {
-        auto length = code_lengths[literal_code_count];
+    if (m_distance_code_count == 1) {
+        auto length = code_lengths[m_literal_code_count];
 
         if (length == 0)
             return {};
@@ -290,19 +368,9 @@ ErrorOr<void> DeflateDecompressor::DynamicCodes::read_and_decode_codes()
             return Error::from_string_literal("Length for a single distance code is longer than 1");
     }
 
-    m_distance_code = TRY(CanonicalCode::from_bytes(code_lengths.span().slice(literal_code_count)));
+    m_distance_code = TRY(CanonicalCode::from_bytes(code_lengths.span().slice(m_literal_code_count)));
 
     return {};
-}
-
-CanonicalCode const& DeflateDecompressor::DynamicCodes::literal_code() const
-{
-    return m_literal_code;
-}
-
-Optional<CanonicalCode> const& DeflateDecompressor::DynamicCodes::distance_code() const
-{
-    return m_distance_code;
 }
 
 DeflateDecompressor::CompressedBlock::CompressedBlock(MaybeOwned<LittleEndianInputBitStream> stream, CircularBuffer& output_buffer, CanonicalCode literal_codes, Optional<CanonicalCode> distance_codes)

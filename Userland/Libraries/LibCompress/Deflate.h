@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/BitStream.h>
 #include <AK/ByteBuffer.h>
 #include <AK/CircularBuffer.h>
 #include <AK/Endian.h>
@@ -102,7 +103,65 @@ private:
         Optional<CanonicalCode> const& distance_code() const;
 
     private:
+        class ReadLiteralCodeCount {
+        public:
+            ReadLiteralCodeCount(MaybeOwned<LittleEndianInputBitStream>);
+
+            ErrorOr<u64> read_literal_code_count();
+
+        private:
+            MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+        };
+
+        class ReadDistanceCodeCount {
+        public:
+            ReadDistanceCodeCount(MaybeOwned<LittleEndianInputBitStream>);
+            ErrorOr<u64> read_distance_code_count();
+
+        private:
+            MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+        };
+
+        class ReadCodeLength {
+        public:
+            ReadCodeLength(MaybeOwned<LittleEndianInputBitStream>);
+            ErrorOr<u64> read_code_length_count();
+
+        private:
+            MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+        };
+
+        class Remainder {
+        public:
+            Remainder(
+                MaybeOwned<LittleEndianInputBitStream>,
+                CanonicalCode& literal_code,
+                Optional<CanonicalCode>& distance_code,
+                u64 literal_code_count,
+                u64 distance_code_count,
+                u64 code_length_count);
+
+            ErrorOr<void> read_remainder();
+
+        private:
+            MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+            CanonicalCode& m_literal_code;
+            Optional<CanonicalCode>& m_distance_code;
+            u64 m_literal_code_count;
+            u64 m_distance_code_count;
+            u64 m_code_length_count;
+        };
+
+        class Complete { };
+
         MaybeOwned<LittleEndianInputBitStream> m_input_stream;
+
+        Variant<ReadLiteralCodeCount, ReadDistanceCodeCount, ReadCodeLength, Remainder, Complete> m_state;
+
+        u64 m_literal_code_count;
+        u64 m_distance_code_count;
+        u64 m_code_length_count;
+
         CanonicalCode m_literal_code;
         Optional<CanonicalCode> m_distance_code;
     };
